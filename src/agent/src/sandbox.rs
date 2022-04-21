@@ -470,7 +470,7 @@ fn online_memory(logger: &Logger) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Sandbox;
+    use super::*;
     use crate::{mount::baremount, skip_if_not_root};
     use anyhow::{anyhow, Error};
     use nix::mount::MsFlags;
@@ -480,6 +480,7 @@ mod tests {
     use rustjail::specconv::CreateOpts;
     use slog::Logger;
     use std::fs::{self, File};
+    use std::io::prelude::*;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use tempfile::{tempdir, Builder, TempDir};
@@ -846,5 +847,197 @@ mod tests {
         // container does not exist
         let p = s.find_container_process("not-exist-cid", "");
         assert!(p.is_err(), "Expecting Error, Got {:?}", p);
+    }
+
+    #[tokio::test]
+    async fn test_online_resources() {
+        #[derive(Debug)]
+        struct TestFile {
+            name: String,
+            content: String,
+        }
+
+        #[derive(Debug)]
+        struct TestDirectory<'a> {
+            name: String,
+            files: &'a[TestFile],
+        }
+
+        #[derive(Debug)]
+        struct TestData<'a> {
+            directory_autogen_name: String,
+            number_autogen_directories: u32,
+
+            extra_directories: &'a[TestDirectory<'a>],
+            pattern: String,
+            to_enable: i32,
+
+            result: i32,
+        }
+
+        impl Default for TestData<'_> {
+            fn default() -> Self {
+                TestData {
+                    directory_autogen_name: String::from(""),
+                    number_autogen_directories: 0,
+                    extra_directories: &[],
+                    pattern: String::from(""),
+                    to_enable: 0,
+                    result: 0
+                }
+            }
+        }
+
+        let tests = &[
+            // 4 well formed directories, request enabled 4, 
+            // correct result 4 enabled, should pass
+            TestData {
+                directory_autogen_name: String::from("cpu"),
+                number_autogen_directories: 4,
+                pattern: String::from(r"cpu[0-9]+"),
+                to_enable: 4,
+                result: 4,
+                ..Default::default()
+            },
+            // 0 well formed directories, request enabled 4, 
+            // correct result 0 enabled, should pass
+            TestData {
+                number_autogen_directories: 0,
+                to_enable: 4,
+                result: 0,
+                ..Default::default()
+            },
+            // 10 well formed directories, request enabled 4, 
+            // correct result 4 enabled, should pass
+            TestData {
+                directory_autogen_name: String::from("cpu"),
+                number_autogen_directories: 10,
+                pattern: String::from(r"cpu[0-9]+"),
+                to_enable: 4,
+                result: 4,
+                ..Default::default()
+            },
+            // 0 well formed directories, request enabled 0, 
+            // correct result 0 enabled, should pass
+            TestData {
+                number_autogen_directories: 0,
+                pattern: String::from(r"cpu[0-9]+"),
+                to_enable: 0,
+                result: 0,
+                ..Default::default()
+            },
+            // 4 well formed directories, 1 malformed (no online file), 
+            // request enable 5, correct result 4
+            TestData {
+                directory_autogen_name: String::from("cpu"),
+                number_autogen_directories: 4,
+                pattern: String::from(r"cpu[0-9]+"),
+                extra_directories: &[
+                    TestDirectory {
+                        name: String::from("cpu4"),
+                        files: &[],
+                    },
+                ],
+                to_enable: 5,
+                result: 4,
+                ..Default::default()
+            },
+            // 3 malformed directories (no online files), 
+            // request enable 3, correct result 0
+            TestData {
+                pattern: String::from(r"cpu[0-9]+"),
+                extra_directories: &[
+                    TestDirectory {
+                        name: String::from("cpu0"),
+                        files: &[],
+                    },
+                    TestDirectory {
+                        name: String::from("cpu1"),
+                        files: &[],
+                    },
+                    TestDirectory {
+                        name: String::from("cpu2"),
+                        files: &[],
+                    },
+                ],
+                to_enable: 3,
+                result: 0,
+                ..Default::default()
+            },
+            // 1 malformed directories (online file with content "1"), 
+            // request enable 1, correct result 0
+            TestData {
+                pattern: String::from(r"cpu[0-9]+"),
+                extra_directories: &[
+                    TestDirectory {
+                        name: String::from("cpu0"),
+                        files: &[
+                            TestFile {
+                                name: SYSFS_ONLINE_FILE.to_string(),
+                                content: String::from("1"),
+                            }
+                        ],
+                    },
+                ],
+                to_enable: 1,
+                result: 0,
+                ..Default::default()
+            },
+            // 2 well formed directories, 1 malformed (online file with content "1"), 
+            // request enable 3, correct result 2
+            TestData {
+                directory_autogen_name: String::from("cpu"),
+                number_autogen_directories: 2,
+                pattern: String::from(r"cpu[0-9]+"),
+                extra_directories: &[
+                    TestDirectory {
+                        name: String::from("cpu2"),
+                        files: &[
+                            TestFile {
+                                name: SYSFS_ONLINE_FILE.to_string(),
+                                content: String::from("1"),
+                            }
+                        ],
+                    },
+                ],
+                to_enable: 3,
+                result: 2,
+                ..Default::default()
+            },
+        ];
+
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let tmpdir = Builder::new().tempdir().unwrap();
+        let tmpdir_path = tmpdir.path().to_str().unwrap();
+
+        for (i, d) in tests.iter().enumerate() {
+            let current_test_dir_path = format!("{}/test_{}", tmpdir_path, i);
+            fs::create_dir(&current_test_dir_path).unwrap();
+
+            // create numbered directories and fill using root name
+            for j in 0..d.number_autogen_directories {
+                let subdir_path = format!("{}/{}{}", current_test_dir_path, d.directory_autogen_name, j); 
+                let subfile_path = format!("{}/{}", subdir_path, SYSFS_ONLINE_FILE);
+                fs::create_dir(&subdir_path).unwrap();
+                let mut subfile = File::create(subfile_path).unwrap();
+                subfile.write_all(b"0").unwrap();
+            }
+            // create extra directories and fill to specification
+            for j in d.extra_directories {
+                let subdir_path = format!("{}/{}", current_test_dir_path, j.name);
+                fs::create_dir(&subdir_path).unwrap();
+                for file in j.files {
+                    let subfile_path = format!("{}/{}", subdir_path, file.name);
+                    let mut subfile = File::create(&subfile_path).unwrap();
+                    subfile.write_all(file.content.as_bytes()).unwrap();
+                }
+            }
+
+            // run created directory structure against online_resources
+            let result = online_resources(&logger, &current_test_dir_path, &d.pattern, d.to_enable).unwrap();
+            let msg = format!("test[{}]: {:?}, expected {}, actual {}", i, d, d.result, result);
+
+            assert_eq!(result, d.result, "{}", msg);
+        }
     }
 }
